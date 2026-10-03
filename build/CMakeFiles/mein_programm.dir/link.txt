@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/mein_programm.dir/src/main.cpp.o -o mein_programm  kiss_icp/pipeline/libkiss_icp_pipeline.a kiss_icp/core/libkiss_icp_core.a /usr/lib/x86_64-linux-gnu/libtbb.so.12.5 

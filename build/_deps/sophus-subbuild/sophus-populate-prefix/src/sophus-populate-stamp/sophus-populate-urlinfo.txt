@@ -1,0 +1,3 @@
+repository='external project URL'
+module='https://github.com/strasdat/Sophus/archive/refs/tags/1.24.6.tar.gz'
+tag=''

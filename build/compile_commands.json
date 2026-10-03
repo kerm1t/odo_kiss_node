@@ -1,0 +1,37 @@
+[
+{
+  "directory": "/home/wolfgang/topics_oct/1_kissicp_node/build/kiss_icp/core",
+  "command": "/usr/bin/c++  -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty -I/home/wolfgang/topics_oct/1_kissicp_node/build/_deps/sophus-src -isystem /usr/include/eigen3 -O3 -DNDEBUG -fPIC -fdiagnostics-color=always -Werror -Wall -Wextra -pedantic -Wcast-align -Wcast-qual -Wconversion -Wdisabled-optimization -Woverloaded-virtual -std=gnu++17 -o CMakeFiles/kiss_icp_core.dir/Registration.cpp.o -c /home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/Registration.cpp",
+  "file": "/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/Registration.cpp"
+},
+{
+  "directory": "/home/wolfgang/topics_oct/1_kissicp_node/build/kiss_icp/core",
+  "command": "/usr/bin/c++  -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty -I/home/wolfgang/topics_oct/1_kissicp_node/build/_deps/sophus-src -isystem /usr/include/eigen3 -O3 -DNDEBUG -fPIC -fdiagnostics-color=always -Werror -Wall -Wextra -pedantic -Wcast-align -Wcast-qual -Wconversion -Wdisabled-optimization -Woverloaded-virtual -std=gnu++17 -o CMakeFiles/kiss_icp_core.dir/VoxelHashMap.cpp.o -c /home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/VoxelHashMap.cpp",
+  "file": "/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/VoxelHashMap.cpp"
+},
+{
+  "directory": "/home/wolfgang/topics_oct/1_kissicp_node/build/kiss_icp/core",
+  "command": "/usr/bin/c++  -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty -I/home/wolfgang/topics_oct/1_kissicp_node/build/_deps/sophus-src -isystem /usr/include/eigen3 -O3 -DNDEBUG -fPIC -fdiagnostics-color=always -Werror -Wall -Wextra -pedantic -Wcast-align -Wcast-qual -Wconversion -Wdisabled-optimization -Woverloaded-virtual -std=gnu++17 -o CMakeFiles/kiss_icp_core.dir/VoxelUtils.cpp.o -c /home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/VoxelUtils.cpp",
+  "file": "/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/VoxelUtils.cpp"
+},
+{
+  "directory": "/home/wolfgang/topics_oct/1_kissicp_node/build/kiss_icp/core",
+  "command": "/usr/bin/c++  -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty -I/home/wolfgang/topics_oct/1_kissicp_node/build/_deps/sophus-src -isystem /usr/include/eigen3 -O3 -DNDEBUG -fPIC -fdiagnostics-color=always -Werror -Wall -Wextra -pedantic -Wcast-align -Wcast-qual -Wconversion -Wdisabled-optimization -Woverloaded-virtual -std=gnu++17 -o CMakeFiles/kiss_icp_core.dir/Preprocessing.cpp.o -c /home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/Preprocessing.cpp",
+  "file": "/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/Preprocessing.cpp"
+},
+{
+  "directory": "/home/wolfgang/topics_oct/1_kissicp_node/build/kiss_icp/core",
+  "command": "/usr/bin/c++  -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty -I/home/wolfgang/topics_oct/1_kissicp_node/build/_deps/sophus-src -isystem /usr/include/eigen3 -O3 -DNDEBUG -fPIC -fdiagnostics-color=always -Werror -Wall -Wextra -pedantic -Wcast-align -Wcast-qual -Wconversion -Wdisabled-optimization -Woverloaded-virtual -std=gnu++17 -o CMakeFiles/kiss_icp_core.dir/Threshold.cpp.o -c /home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/Threshold.cpp",
+  "file": "/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/core/Threshold.cpp"
+},
+{
+  "directory": "/home/wolfgang/topics_oct/1_kissicp_node/build/kiss_icp/metrics",
+  "command": "/usr/bin/c++  -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/metrics -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty -isystem /usr/include/eigen3 -O3 -DNDEBUG -fPIC -fdiagnostics-color=always -Werror -Wall -Wextra -pedantic -Wcast-align -Wcast-qual -Wconversion -Wdisabled-optimization -Woverloaded-virtual -std=gnu++17 -o CMakeFiles/kiss_icp_metrics.dir/Metrics.cpp.o -c /home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/metrics/Metrics.cpp",
+  "file": "/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/metrics/Metrics.cpp"
+},
+{
+  "directory": "/home/wolfgang/topics_oct/1_kissicp_node/build/kiss_icp/pipeline",
+  "command": "/usr/bin/c++  -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/pipeline -I/home/wolfgang/topics_oct/1_kissicp_node/thirdparty -I/home/wolfgang/topics_oct/1_kissicp_node/build/_deps/sophus-src -isystem /usr/include/eigen3 -O3 -DNDEBUG -fPIC -fdiagnostics-color=always -Werror -Wall -Wextra -pedantic -Wcast-align -Wcast-qual -Wconversion -Wdisabled-optimization -Woverloaded-virtual -std=gnu++17 -o CMakeFiles/kiss_icp_pipeline.dir/KissICP.cpp.o -c /home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/pipeline/KissICP.cpp",
+  "file": "/home/wolfgang/topics_oct/1_kissicp_node/thirdparty/kiss_icp/pipeline/KissICP.cpp"
+}
+]
