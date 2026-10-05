@@ -1,15 +1,21 @@
-// ply_odom - relative pose between two PLY scans via KISS-ICP.
+// ply_odom - KISS-ICP odometry over a sequence of PLY scans.
 //
-//   ply_odom <a.ply> <b.ply> [max_range_m=100] [voxel_m=max_range/100]
+//   ply_odom <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m] [-v voxel_m]
 //
-// Prints T_a_b with p_a = T_a_b * p_b, i.e. the sensor pose at scan b
-// expressed in scan a's frame (= the odometry step a -> b).
+// A directory is scanned for *.ply and sorted naturally (frame_2 < frame_10);
+// files given explicitly keep their order. Writes one pose per frame in KITTI
+// format (3x4 row-major, 12 values per line). Poses are T_0_i with
+// p_0 = T_0_i * p_i, i.e. the sensor pose at frame i in the first frame.
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <filesystem>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -18,6 +24,7 @@
 #include <happly.h>
 #include <kiss_icp/pipeline/KissICP.hpp>
 
+namespace fs = std::filesystem;
 using Cloud = std::vector<Eigen::Vector3d>;
 using Clock = std::chrono::steady_clock;
 
@@ -38,100 +45,173 @@ static Cloud loadPly(const std::string &path) {
     return pts;
 }
 
-// Rough alignment check: share of `src` points (moved by T) that have a
-// neighbour in `map` closer than `max_dist`, plus the RMSE over those.
-struct Fit {
-    double inliers = 0.0;
-    double rmse = 0.0;
-};
-
-static Fit evalFit(const Cloud &src,
-                   const Sophus::SE3d &T,
-                   const kiss_icp::VoxelHashMap &map,
-                   double max_dist) {
-    size_t n = 0;
-    double sq = 0.0;
-    for (const auto &p : src) {
-        const double d = std::get<1>(map.GetClosestNeighbor(T * p));
-        if (d < max_dist) {
-            ++n;
-            sq += d * d;
+// "frame_2" < "frame_10": digit runs compare by value.
+static bool naturalLess(const std::string &a, const std::string &b) {
+    const auto dig = [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; };
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (dig(a[i]) && dig(b[j])) {
+            size_t ie = i, je = j;
+            while (ie < a.size() && dig(a[ie])) ++ie;
+            while (je < b.size() && dig(b[je])) ++je;
+            while (i + 1 < ie && a[i] == '0') ++i;  // leading zeros
+            while (j + 1 < je && b[j] == '0') ++j;
+            if (ie - i != je - j) return ie - i < je - j;
+            const int c = a.compare(i, ie - i, b, j, je - j);
+            if (c != 0) return c < 0;
+            i = ie;
+            j = je;
+        } else {
+            if (a[i] != b[j]) return a[i] < b[j];
+            ++i;
+            ++j;
         }
     }
-    Fit f;
-    if (!src.empty()) f.inliers = static_cast<double>(n) / static_cast<double>(src.size());
-    if (n > 0) f.rmse = std::sqrt(sq / static_cast<double>(n));
-    return f;
+    return a.size() - i < b.size() - j;
+}
+
+static std::vector<std::string> listPly(const fs::path &dir) {
+    std::vector<std::string> files;
+    for (const auto &e : fs::directory_iterator(dir)) {
+        if (!e.is_regular_file()) continue;
+        std::string ext = e.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".ply") files.push_back(e.path().string());
+    }
+    std::sort(files.begin(), files.end(), naturalLess);
+    return files;
+}
+
+// Rough alignment check: share of `src` points (moved by T) with a neighbour
+// in `map` closer than `max_dist`.
+static double inlierShare(const Cloud &src,
+                          const Sophus::SE3d &T,
+                          const kiss_icp::VoxelHashMap &map,
+                          double max_dist) {
+    if (src.empty()) return 0.0;
+    size_t n = 0;
+    for (const auto &p : src) {
+        if (std::get<1>(map.GetClosestNeighbor(T * p)) < max_dist) ++n;
+    }
+    return static_cast<double>(n) / static_cast<double>(src.size());
+}
+
+static int usage(const char *argv0) {
+    std::fprintf(stderr,
+                 "usage: %s <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m=100] "
+                 "[-v voxel_m=max_range/100]\n",
+                 argv0);
+    return 1;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <a.ply> <b.ply> [max_range_m=100] [voxel_m=max_range/100]\n",
-                     argv[0]);
+    std::vector<std::string> files;
+    std::string out_path = "traj.txt";
+    double max_range = 100.0, voxel = -1.0;
+
+    for (int i = 1; i < argc; ++i) {
+        const bool has_val = i + 1 < argc;
+        if (!std::strcmp(argv[i], "-o") && has_val) {
+            out_path = argv[++i];
+        } else if (!std::strcmp(argv[i], "-r") && has_val) {
+            max_range = std::atof(argv[++i]);
+        } else if (!std::strcmp(argv[i], "-v") && has_val) {
+            voxel = std::atof(argv[++i]);
+        } else if (argv[i][0] == '-') {
+            return usage(argv[0]);
+        } else if (fs::is_directory(argv[i])) {
+            const auto found = listPly(argv[i]);
+            files.insert(files.end(), found.begin(), found.end());
+        } else {
+            files.emplace_back(argv[i]);
+        }
+    }
+    if (voxel < 0.0) voxel = max_range / 100.0;
+    if (max_range <= 0.0 || voxel <= 0.0) return usage(argv[0]);
+    if (files.size() < 2) {
+        std::fprintf(stderr, "need at least 2 PLY files (got %zu)\n", files.size());
+        return usage(argv[0]);
+    }
+
+    FILE *out = std::fopen(out_path.c_str(), "w");
+    if (!out) {
+        std::fprintf(stderr, "cannot write %s\n", out_path.c_str());
         return 1;
     }
 
     kiss_icp::pipeline::KISSConfig cfg;
-    cfg.max_range = argc > 3 ? std::atof(argv[3]) : 100.0;
-    cfg.voxel_size = argc > 4 ? std::atof(argv[4]) : cfg.max_range / 100.0;
-    cfg.deskew = false;  // single scans, no per-point timestamps
-    if (cfg.max_range <= 0.0 || cfg.voxel_size <= 0.0) {
-        std::fprintf(stderr, "max_range and voxel must be > 0\n");
-        return 1;
-    }
-
-    Cloud a, b;
-    try {
-        auto t0 = Clock::now();
-        a = loadPly(argv[1]);
-        b = loadPly(argv[2]);
-        std::printf("loaded  a: %zu pts, b: %zu pts  (%.0f ms)\n", a.size(), b.size(), msSince(t0));
-    } catch (const std::exception &e) {
-        std::fprintf(stderr, "PLY load failed: %s\n", e.what());
-        return 1;
-    }
-    if (a.empty() || b.empty()) {
-        std::fprintf(stderr, "empty cloud\n");
-        return 1;
-    }
-
+    cfg.max_range = max_range;
+    cfg.voxel_size = voxel;
+    cfg.deskew = false;  // no per-point timestamps in the PLYs
     kiss_icp::pipeline::KissICP odom(cfg);
     const std::vector<double> no_stamps;
 
-    // Scan a only seeds the local map; pose stays identity.
-    auto t0 = Clock::now();
-    odom.RegisterFrame(a, no_stamps);
-    const kiss_icp::VoxelHashMap map_a = odom.VoxelMap();  // keep a-only map for the fit check
-    const double ms_a = msSince(t0);
+    std::printf("%zu files, max_range %.1f m, voxel %.2f m\n", files.size(), max_range, voxel);
+    std::printf("%9s  %-28s %9s %9s %9s %7s %8s\n", "frame", "file", "points", "step[m]",
+                "rot[deg]", "fit[%]", "ms");
 
-    // Scan b is registered against that map, initial guess = identity.
-    t0 = Clock::now();
-    const Cloud src_b = std::get<1>(odom.RegisterFrame(b, no_stamps));  // downsampled b
-    const double ms_b = msSince(t0);
-
-    const Sophus::SE3d T = odom.pose();
-    const Eigen::Matrix4d M = T.matrix();
-    const Eigen::Vector3d t = T.translation();
     const double rad2deg = 180.0 / 3.14159265358979323846;
-    const Eigen::Vector3d rv = T.so3().log() * rad2deg;  // rotation vector [deg]
+    const auto t_total = Clock::now();
+    size_t n_ok = 0;
+    double path_len = 0.0;
 
-    const Fit before = evalFit(src_b, Sophus::SE3d(), map_a, cfg.voxel_size);
-    const Fit after = evalFit(src_b, T, map_a, cfg.voxel_size);
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::string name = fs::path(files[i]).filename().string();
+        Cloud cloud;
+        try {
+            cloud = loadPly(files[i]);
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "skip %s: %s\n", name.c_str(), e.what());
+            continue;
+        }
+        if (cloud.empty()) {
+            std::fprintf(stderr, "skip %s: no valid points\n", name.c_str());
+            continue;
+        }
 
-    std::printf("config  max_range %.1f m, voxel %.2f m, %zu src pts after downsampling\n",
-                cfg.max_range, cfg.voxel_size, src_b.size());
-    std::printf("timing  map init %.1f ms, registration %.1f ms\n\n", ms_a, ms_b);
+        // Map as it was before this frame went in, for the fit check.
+        const kiss_icp::VoxelHashMap map_prev = odom.VoxelMap();
 
-    std::printf("T_a_b (p_a = T_a_b * p_b):\n");
+        // First frame only seeds the map (pose = identity). Later frames are
+        // registered against it, initial guess = constant-velocity prediction.
+        const auto t0 = Clock::now();
+        const Cloud src = std::get<1>(odom.RegisterFrame(cloud, no_stamps));
+        const double ms = msSince(t0);
+
+        const Sophus::SE3d &T = odom.pose();
+        const Sophus::SE3d &d = odom.delta();
+        const Eigen::Matrix<double, 3, 4> M = T.matrix3x4();
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                std::fprintf(out, "%.9g%c", M(r, c), (r == 2 && c == 3) ? '\n' : ' ');
+            }
+        }
+
+        const double step = d.translation().norm();
+        path_len += step;
+        std::printf("%4zu/%-4zu  %-28s %9zu ", i + 1, files.size(), name.c_str(), cloud.size());
+        if (n_ok == 0) {
+            std::printf("%9s %9s %7s %8.1f\n", "-", "-", "-", ms);
+        } else {
+            std::printf("%9.3f %9.3f %7.1f %8.1f\n", step, d.so3().log().norm() * rad2deg,
+                        100.0 * inlierShare(src, T, map_prev, voxel), ms);
+        }
+        ++n_ok;
+    }
+    std::fclose(out);
+
+    if (n_ok < 2) {
+        std::fprintf(stderr, "fewer than 2 usable frames, no trajectory\n");
+        return 1;
+    }
+
+    const Eigen::Matrix4d M = odom.pose().matrix();
+    std::printf("\n%zu poses -> %s  (path %.2f m, %.1f s)\n", n_ok, out_path.c_str(), path_len,
+                msSince(t_total) / 1000.0);
+    std::printf("final pose T_0_n:\n");
     for (int r = 0; r < 4; ++r) {
         std::printf("  % .6f % .6f % .6f % .6f\n", M(r, 0), M(r, 1), M(r, 2), M(r, 3));
     }
-    std::printf("\ntrans [m]    % .4f % .4f % .4f   |t| = %.4f\n", t.x(), t.y(), t.z(), t.norm());
-    std::printf("rotvec [deg] % .4f % .4f % .4f   angle = %.4f\n", rv.x(), rv.y(), rv.z(),
-                rv.norm());
-    std::printf("\nfit (NN < %.2f m)  identity: %5.1f %% inliers, rmse %.3f m\n", cfg.voxel_size,
-                100.0 * before.inliers, before.rmse);
-    std::printf("                    aligned:  %5.1f %% inliers, rmse %.3f m\n",
-                100.0 * after.inliers, after.rmse);
     return 0;
 }

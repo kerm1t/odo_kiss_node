@@ -1,6 +1,6 @@
-# ply_odom: relative pose between two PLY scans with KISS-ICP
+# ply_odom: KISS-ICP odometry over a sequence of PLY scans -> trajectory file
 #   cmake -B build && cmake --build build -j
-#   ./build/ply_odom a.ply b.ply
+#   ./build/ply_odom <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m] [-v voxel_m]
 cmake_minimum_required(VERSION 3.16...3.28)
 project(ply_odom LANGUAGES CXX)
 
