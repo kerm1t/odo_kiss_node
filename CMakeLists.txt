@@ -5,8 +5,8 @@
 #
 #   cmake -B build && cmake --build build -j
 #   ./build/ply_odom <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m] [-v voxel_m] [-p pts_per_voxel] [-i max_icp_iter] [-d vis_voxel_m] [-n]
-#   ./build/kiss_odom_node [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>] [-r ..] [-v ..] [-p ..] [-i ..] [-q] [--viz] [-d vis_voxel_m]
-#   ./build/ply_pub <dir> [--out pointcloud] [--hz 10] [--frame lidar] [--loop]
+#   ./build/kiss_odom_node [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>] [-r ..] [-v ..] [-p ..] [-i ..] [-q] [--viz] [-d vis_voxel_m] [--time-field auto|none|<name>] [--time-unit auto|s|ms|us|ns]
+#   ./build/ply_pub <dir> [--out pointcloud] [--hz 10] [--rate <hz>] [--frame lidar] [--loop]
 cmake_minimum_required(VERSION 3.16...3.28)
 project(ply_odom LANGUAGES CXX)
 

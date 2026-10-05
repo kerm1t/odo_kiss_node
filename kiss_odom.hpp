@@ -4,10 +4,15 @@
 // written out on the core modules so every stage can be timed and the fit can
 // be checked before the scan goes into the map.
 //
-// One addition: if frames carry timestamps, the constant-velocity prediction
-// is scaled by the ratio of the time steps, so a dropped or late frame does
-// not throw the initial guess off. With regular steps (within 5 %) or without
-// timestamps the behaviour is exactly stock KISS-ICP.
+// Two additions, both only active when timing information is passed in:
+//  - Frame timestamps: the constant-velocity prediction is scaled by the ratio
+//    of the time steps, so a dropped or late frame does not throw the initial
+//    guess off. With regular steps (within 5 %) it is exactly stock KISS-ICP.
+//  - Per-point times: the scan is deskewed by KISS-ICP's Preprocessor, to the
+//    time of its last point. Stock KISS-ICP spreads the whole frame-to-frame
+//    motion over the scan, i.e. assumes the scan takes the full frame period.
+//    Here the motion is scaled to the measured scan duration when the frame
+//    period is known, which matters for sensors that scan in part of it.
 #pragma once
 
 #include <algorithm>
@@ -43,11 +48,12 @@ public:
         double dt = -1.0;    // time since the previous frame [s], < 0 if unknown
         bool first = false;  // first frame: only seeds the map, pose = identity
         double fit = 0.0;    // share of ICP points with a map neighbour < voxel, 0..1
-        double ms_pre = 0.0, ms_icp = 0.0, ms_map = 0.0;  // crop+downsample, ICP, map update
+        double scan_s = 0.0;  // scan duration used for deskewing [s], 0 = not deskewed
+        double ms_pre = 0.0, ms_icp = 0.0, ms_map = 0.0;  // deskew+crop+downsample, ICP, map update
         size_t n_src = 0;     // points used for ICP
         size_t n_voxels = 0;  // voxels in the local map
         double sigma = 0.0;   // adaptive threshold used for this frame
-        Cloud frame;          // range-cropped input scan (sensor frame)
+        Cloud frame;          // deskewed, range-cropped input scan (sensor frame)
     };
 
     explicit KissOdom(const Params &p)
@@ -71,7 +77,12 @@ public:
     }
 
     // Register one scan (sensor frame). `stamp` in seconds, < 0 if unknown.
-    Result registerFrame(const Cloud &cloud, double stamp = -1.0) {
+    // `point_times`: per-point time in seconds (any origin), one per point, or
+    // empty for no deskewing. With deskewing the pose refers to the time of the
+    // scan's last point.
+    Result registerFrame(const Cloud &cloud,
+                         double stamp = -1.0,
+                         const std::vector<double> &point_times = {}) {
         using Clock = std::chrono::steady_clock;
         const auto ms = [](Clock::time_point t0) {
             return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -79,11 +90,27 @@ public:
         Result r;
         r.first = first_;
 
+        auto t0 = Clock::now();
+
+        // Deskew: motion during the scan = last step, scaled from its time step
+        // to the scan duration (unscaled, as in stock KISS-ICP, if dt is unknown).
+        static const std::vector<double> no_times;
+        const std::vector<double> *times = &no_times;
+        Sophus::SE3d scan_motion;
+        if (!first_ && !cloud.empty() && point_times.size() == cloud.size()) {
+            const auto mm = std::minmax_element(point_times.cbegin(), point_times.cend());
+            const double duration = *mm.second - *mm.first;
+            if (duration > 0.0) {  // all-equal times would divide by zero inside KISS-ICP
+                const double scale = last_dt_ > 0.0 ? std::min(duration / last_dt_, 1.0) : 1.0;
+                scan_motion = Sophus::SE3d::exp(scale * delta_.log());
+                times = &point_times;
+                r.scan_s = duration;
+            }
+        }
+
         // Range crop, then two-stage downsampling: `frame_ds` goes into the map,
         // the sparser `src` is what ICP aligns.
-        auto t0 = Clock::now();
-        static const std::vector<double> no_stamps;  // no per-point times, no deskew
-        r.frame = preprocessor_.Preprocess(cloud, no_stamps, delta_);
+        r.frame = preprocessor_.Preprocess(cloud, *times, scan_motion);
         const Cloud frame_ds = kiss_icp::VoxelDownsample(r.frame, cfg_.voxel_size * 0.5);
         const Cloud src = kiss_icp::VoxelDownsample(frame_ds, cfg_.voxel_size * 1.5);
         r.ms_pre = ms(t0);
@@ -142,7 +169,7 @@ private:
         c.voxel_size = p.voxel;
         c.max_points_per_voxel = p.max_points_per_voxel;
         c.max_num_iterations = p.max_iterations;
-        c.deskew = false;
+        c.deskew = true;  // only takes effect when per-point times are passed
         return c;
     }
 

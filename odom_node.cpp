@@ -2,14 +2,22 @@
 //
 //   kiss_odom_node [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>]
 //                  [-r max_range_m] [-v voxel_m] [-p max_points_per_voxel] [-i max_icp_iterations] [-q]
-//                  [--viz] [-d vis_voxel_m]
+//                  [--viz] [-d vis_voxel_m] [--time-field auto|none|<name>] [--time-unit auto|s|ms|us|ns]
 //
 // Output per input cloud, stamped with the cloud's timestamp:
 //   frame_id         odom frame (= sensor frame at the first cloud)
 //   body_frame_id    the cloud's frame_id (or --body-frame)
-//   pose             body in odom frame, absolute (accumulated)
+//   pose             body in odom frame, absolute (accumulated); with deskewing
+//                    it is the pose at the time of the scan's last point
 //   linear/angular_velocity   per-epoch motion / dt, in the body frame
-//   metadata         fit, sigma, proc_ms, dropped
+//   metadata         fit, sigma, proc_ms, dropped, scan_ms
+//
+// Deskew: if the cloud has a per-point time field, the times are handed to
+// KISS-ICP, which moves every point to where it would have been measured at
+// the end of the scan. --time-field auto takes the first field named t, time,
+// timestamp, time_stamp, stamp, offset_time or time_offset (any numeric type);
+// --time-field none turns deskewing off. --time-unit auto takes the largest of
+// s / ms / us / ns that makes the scan last at most 1 s.
 //
 // The receive callback only parses the cloud into a single-slot buffer: if a
 // new cloud arrives while the previous one is still being registered, the
@@ -21,6 +29,8 @@
 // to a worker thread; without --viz registration runs on the main thread.
 // Closing the window only closes the viewer, the node keeps running.
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -32,6 +42,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <ecal/ecal.h>
 #include <ecal/msg/protobuf/publisher.h>
@@ -60,21 +71,95 @@ struct Args {
     double vis_voxel = -1.0;  // default voxel / 4
     bool quiet = false;
     bool viz = false;
+    std::string time_field = "auto";  // auto | none | <field name>
+    std::string time_unit = "auto";   // auto | s | ms | us | ns
 };
 
 // One received cloud, parsed, waiting for registration.
 struct Pending {
     Cloud cloud;
-    double stamp = -1.0;  // seconds
+    std::vector<double> times;  // per-point time, raw field values; empty if no time field
+    std::string time_field;     // name of the field `times` came from
+    std::string field_names;    // all field names, for the "no time field" hint
+    double stamp = -1.0;        // seconds
     google::protobuf::Timestamp ts;
     std::string frame_id;
     bool valid = false;
 };
 
-// Extract x/y/z (FLOAT32 or FLOAT64) from the packed data and move the points
-// into frame_id if the message carries a non-identity pose.
-static bool toCloud(const foxglove::PointCloud &msg, Cloud &out, std::string &err) {
-    using Field = foxglove::PackedElementField;
+using Field = foxglove::PackedElementField;
+
+static size_t numericSize(Field::NumericType type) {
+    switch (type) {
+        case Field::UINT8:
+        case Field::INT8:
+            return 1;
+        case Field::UINT16:
+        case Field::INT16:
+            return 2;
+        case Field::UINT32:
+        case Field::INT32:
+        case Field::FLOAT32:
+            return 4;
+        case Field::FLOAT64:
+            return 8;
+        default:
+            return 0;
+    }
+}
+
+static double readNumeric(const char *p, Field::NumericType type) {
+    switch (type) {
+        case Field::UINT8: { uint8_t v; std::memcpy(&v, p, 1); return v; }
+        case Field::INT8: { int8_t v; std::memcpy(&v, p, 1); return v; }
+        case Field::UINT16: { uint16_t v; std::memcpy(&v, p, 2); return v; }
+        case Field::INT16: { int16_t v; std::memcpy(&v, p, 2); return v; }
+        case Field::UINT32: { uint32_t v; std::memcpy(&v, p, 4); return v; }
+        case Field::INT32: { int32_t v; std::memcpy(&v, p, 4); return v; }
+        case Field::FLOAT32: { float v; std::memcpy(&v, p, 4); return v; }
+        case Field::FLOAT64: { double v; std::memcpy(&v, p, 8); return v; }
+        default: return 0.0;
+    }
+}
+
+// The per-point time field: the one named `want`, or for "auto" the first of the usual names.
+static const Field *findTimeField(const foxglove::PointCloud &msg, const std::string &want) {
+    if (want == "none") return nullptr;
+    const auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+    const auto find = [&](const std::string &name) -> const Field * {
+        for (const auto &field : msg.fields()) {
+            if (lower(field.name()) == name) return &field;
+        }
+        return nullptr;
+    };
+    if (want != "auto") return find(lower(want));
+    for (const char *name :
+         {"t", "time", "timestamp", "time_stamp", "stamp", "offset_time", "time_offset"}) {
+        if (const Field *f = find(name)) return f;
+    }
+    return nullptr;
+}
+
+// Seconds per raw unit of the time field: the largest of s / ms / us / ns for
+// which a scan of `raw_range` lasts at most 1 s.
+static double autoTimeUnit(double raw_range) {
+    for (const double unit : {1.0, 1e-3, 1e-6}) {
+        if (raw_range * unit <= 1.0) return unit;
+    }
+    return 1e-9;
+}
+
+// Extract x/y/z (FLOAT32 or FLOAT64) and, if present, the per-point time from
+// the packed data, and move the points into frame_id if the message carries a
+// non-identity pose.
+static bool toCloud(const foxglove::PointCloud &msg,
+                    const std::string &time_field,
+                    Pending &out,
+                    std::string &err) {
     const Field *f[3] = {nullptr, nullptr, nullptr};
     for (const auto &field : msg.fields()) {
         if (field.name() == "x") f[0] = &field;
@@ -99,10 +184,23 @@ static bool toCloud(const foxglove::PointCloud &msg, Cloud &out, std::string &er
         if (off[k] + (is_f32[k] ? 4 : 8) > stride) return fail("field offset beyond point_stride");
     }
 
+    const Field *ft = findTimeField(msg, time_field);
+    if (ft && (numericSize(ft->type()) == 0 || ft->offset() + numericSize(ft->type()) > stride)) {
+        ft = nullptr;  // unknown type or out of bounds: treat as absent
+    }
+    if (ft) {
+        out.time_field = ft->name();
+    } else {
+        for (const auto &field : msg.fields()) out.field_names += field.name() + " ";
+    }
+
     const std::string &data = msg.data();
     const size_t n = data.size() / stride;
-    out.clear();
-    out.reserve(n);
+    Cloud &pts = out.cloud;
+    pts.clear();
+    pts.reserve(n);
+    out.times.clear();
+    if (ft) out.times.reserve(n);
     const char *p = data.data();
     for (size_t i = 0; i < n; ++i, p += stride) {
         double v[3];
@@ -116,7 +214,8 @@ static bool toCloud(const foxglove::PointCloud &msg, Cloud &out, std::string &er
             }
         }
         if (std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2])) {
-            out.emplace_back(v[0], v[1], v[2]);
+            pts.emplace_back(v[0], v[1], v[2]);
+            if (ft) out.times.push_back(readNumeric(p + ft->offset(), ft->type()));
         }
     }
 
@@ -128,7 +227,7 @@ static bool toCloud(const foxglove::PointCloud &msg, Cloud &out, std::string &er
         if (rot.norm() < 1e-6) rot = Eigen::Quaterniond::Identity();  // unset orientation
         const Sophus::SE3d T(rot.normalized(), Eigen::Vector3d(t.x(), t.y(), t.z()));
         if (T.log().norm() > 1e-9) {
-            for (auto &pt : out) pt = T * pt;
+            for (auto &pt : pts) pt = T * pt;
         }
     }
     return true;
@@ -139,7 +238,8 @@ static int usage(const char *argv0) {
                  "usage: %s [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>]\n"
                  "       [-r max_range_m=100] [-v voxel_m=max_range/100] [-p max_points_per_voxel=20]\n"
                  "       [-i max_icp_iterations=500] [-q (no per-frame log)]\n"
-                 "       [--viz (show viewer)] [-d vis_voxel_m=voxel/4]\n",
+                 "       [--viz (show viewer)] [-d vis_voxel_m=voxel/4]\n"
+                 "       [--time-field auto|none|<name>] [--time-unit auto|s|ms|us|ns]  (deskew)\n",
                  argv0);
     return 1;
 }
@@ -171,12 +271,22 @@ int main(int argc, char **argv) {
             args.quiet = true;
         } else if (is("--viz")) {
             args.viz = true;
+        } else if (is("--time-field") && has_val) {
+            args.time_field = argv[++i];
+        } else if (is("--time-unit") && has_val) {
+            args.time_unit = argv[++i];
         } else {
             return usage(argv[0]);
         }
     }
     args.odom.voxel = args.voxel > 0.0 ? args.voxel : args.odom.max_range / 100.0;
     if (args.vis_voxel <= 0.0) args.vis_voxel = args.odom.voxel / 4.0;
+    double time_unit = 0.0;  // seconds per raw unit of the time field, 0 = detect
+    if (args.time_unit == "s") time_unit = 1.0;
+    else if (args.time_unit == "ms") time_unit = 1e-3;
+    else if (args.time_unit == "us") time_unit = 1e-6;
+    else if (args.time_unit == "ns") time_unit = 1e-9;
+    else if (args.time_unit != "auto") return usage(argv[0]);
     if (args.odom.max_range <= 0.0 || args.odom.max_points_per_voxel < 1 ||
         args.odom.max_iterations < 1) {
         return usage(argv[0]);
@@ -198,7 +308,7 @@ int main(int argc, char **argv) {
                                long long, long long) {
         Pending p;
         std::string err;
-        if (!toCloud(msg, p.cloud, err)) {
+        if (!toCloud(msg, args.time_field, p, err)) {
             std::fprintf(stderr, "bad point cloud on '%s': %s\n", args.in.c_str(), err.c_str());
             return;
         }
@@ -225,9 +335,10 @@ int main(int argc, char **argv) {
                 args.odom.max_range, args.odom.voxel, args.odom.max_points_per_voxel,
                 args.odom.max_iterations);
     if (!args.quiet) {
-        std::printf("%7s %8s %8s %8s %6s %7s %8s %7s %6s %7s %6s %7s\n", "frame", "points",
-                    "step[m]", "rot[deg]", "fit[%]", "pre[ms]", "icp[ms]", "map[ms]", "src",
-                    "vox", "sigma", "dropped");
+        // scan[ms] = scan duration used for deskewing, 0 = not deskewed
+        std::printf("%7s %8s %8s %8s %6s %8s %7s %8s %7s %6s %7s %6s %7s\n", "frame", "points",
+                    "step[m]", "rot[deg]", "fit[%]", "scan[ms]", "pre[ms]", "icp[ms]", "map[ms]",
+                    "src", "vox", "sigma", "dropped");
     }
     std::fflush(stdout);
 
@@ -237,6 +348,7 @@ int main(int argc, char **argv) {
         const double rad2deg = 180.0 / 3.14159265358979323846;
         size_t n_frames = 0;
         double last_stamp = -1.0;
+        bool time_unit_auto = false, deskew_reported = false;
 #ifndef PLY_ODOM_VIEWER
         (void)feed;
 #endif
@@ -267,8 +379,41 @@ int main(int argc, char **argv) {
             }
             last_stamp = p.stamp;
 
+            // Per-point times: raw field values -> seconds since the scan's first point.
+            if (!p.times.empty()) {
+                const auto mm = std::minmax_element(p.times.cbegin(), p.times.cend());
+                const double t_min = *mm.first, range = *mm.second - *mm.first;
+                if (time_unit <= 0.0 && range > 0.0) {
+                    time_unit = autoTimeUnit(range);
+                    time_unit_auto = true;
+                }
+                if (time_unit > 0.0 && range > 0.0) {
+                    for (double &t : p.times) t = (t - t_min) * time_unit;
+                } else {
+                    p.times.clear();  // constant field: nothing to deskew with
+                }
+                if (!deskew_reported && !p.times.empty()) {
+                    const char *unit = time_unit == 1.0    ? "s"
+                                       : time_unit == 1e-3 ? "ms"
+                                       : time_unit == 1e-6 ? "us"
+                                                           : "ns";
+                    std::printf("deskew on: time field '%s', unit %s%s, scan duration %.1f ms\n",
+                                p.time_field.c_str(), unit, time_unit_auto ? " (auto)" : "",
+                                1e3 * range * time_unit);
+                    std::fflush(stdout);
+                    deskew_reported = true;
+                }
+            } else if (!deskew_reported && args.time_field != "none") {
+                std::printf("deskew off: no per-point time field%s%s in the cloud (fields: %s)\n",
+                            args.time_field == "auto" ? "" : " ",
+                            args.time_field == "auto" ? "" : args.time_field.c_str(),
+                            p.field_names.c_str());
+                std::fflush(stdout);
+                deskew_reported = true;
+            }
+
             const auto t0 = Clock::now();
-            const KissOdom::Result r = odom.registerFrame(p.cloud, p.stamp);
+            const KissOdom::Result r = odom.registerFrame(p.cloud, p.stamp, p.times);
             const double proc_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             ++n_frames;
 
@@ -309,6 +454,7 @@ int main(int argc, char **argv) {
             meta("sigma", std::to_string(r.sigma));
             meta("proc_ms", std::to_string(proc_ms));
             meta("dropped", std::to_string(n_dropped));
+            meta("scan_ms", std::to_string(1e3 * r.scan_s));
             pub.Send(msg);
 
             // Process state for the eCAL monitor: warn when the registration looks poor.
@@ -329,8 +475,8 @@ int main(int argc, char **argv) {
                     std::printf("%8.3f %8.3f %6.1f ", r.delta.translation().norm(),
                                 r.delta.so3().log().norm() * rad2deg, 100.0 * r.fit);
                 }
-                std::printf("%7.1f %8.1f %7.1f %6zu %7zu %6.2f %7zu\n", r.ms_pre, r.ms_icp, r.ms_map,
-                            r.n_src, r.n_voxels, r.sigma, n_dropped);
+                std::printf("%8.1f %7.1f %8.1f %7.1f %6zu %7zu %6.2f %7zu\n", 1e3 * r.scan_s, r.ms_pre,
+                            r.ms_icp, r.ms_map, r.n_src, r.n_voxels, r.sigma, n_dropped);
                 std::fflush(stdout);
             }
         }

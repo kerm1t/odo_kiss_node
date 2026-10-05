@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <exception>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -12,14 +13,34 @@
 #include <happly.h>
 
 // Vertex positions of a PLY file (float or double x/y/z), non-finite points removed.
-inline std::vector<Eigen::Vector3d> loadPly(const std::string &path) {
+// If `times` is given and the vertices carry a float/double property named
+// t, time or timestamp, it is returned per point (raw values); else left empty.
+inline std::vector<Eigen::Vector3d> loadPly(const std::string &path,
+                                            std::vector<double> *times = nullptr) {
     happly::PLYData ply(path);
     const auto v = ply.getVertexPositions();  // float or double x/y/z
+    std::vector<double> t;
+    if (times) {
+        happly::Element &vertex = ply.getElement("vertex");
+        for (const char *name : {"t", "time", "timestamp"}) {
+            if (!vertex.hasProperty(name)) continue;
+            try {
+                t = vertex.getProperty<double>(name);
+            } catch (const std::exception &) {  // not a float/double property
+            }
+            break;
+        }
+        if (t.size() != v.size()) t.clear();
+        times->clear();
+        times->reserve(t.size());
+    }
     std::vector<Eigen::Vector3d> pts;
     pts.reserve(v.size());
-    for (const auto &p : v) {
+    for (size_t i = 0; i < v.size(); ++i) {
+        const auto &p = v[i];
         if (std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2])) {
             pts.emplace_back(p[0], p[1], p[2]);
+            if (!t.empty()) times->push_back(t[i]);
         }
     }
     return pts;
