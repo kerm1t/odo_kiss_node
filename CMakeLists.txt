@@ -5,7 +5,7 @@
 #
 #   cmake -B build && cmake --build build -j
 #   ./build/ply_odom <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m] [-v voxel_m] [-p pts_per_voxel] [-i max_icp_iter] [-d vis_voxel_m] [-n]
-#   ./build/kiss_odom_node [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>] [-r ..] [-v ..] [-p ..] [-i ..] [-q]
+#   ./build/kiss_odom_node [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>] [-r ..] [-v ..] [-p ..] [-i ..] [-q] [--viz] [-d vis_voxel_m]
 #   ./build/ply_pub <dir> [--out pointcloud] [--hz 10] [--frame lidar] [--loop]
 cmake_minimum_required(VERSION 3.16...3.28)
 project(ply_odom LANGUAGES CXX)
@@ -44,23 +44,33 @@ target_link_libraries(ply_odom PRIVATE kiss_icp_pipeline Threads::Threads)
 
 # Viewer: system SDL2 + OpenGL (Linux: libsdl2-dev libgl-dev, macOS: brew install sdl2).
 # Falls back to a headless build when either is missing.
+set(HAVE_VIEWER OFF)
 if(WITH_VIEWER)
   find_package(SDL2 QUIET)
   find_package(OpenGL QUIET)
   if(SDL2_FOUND AND OpenGL_FOUND)
-    target_compile_definitions(ply_odom PRIVATE PLY_ODOM_VIEWER)
-    if(TARGET SDL2::SDL2)
-      target_link_libraries(ply_odom PRIVATE SDL2::SDL2)
-    else() # older SDL2 packages only export variables
-      target_include_directories(ply_odom SYSTEM PRIVATE ${SDL2_INCLUDE_DIRS})
-      target_link_libraries(ply_odom PRIVATE ${SDL2_LIBRARIES})
-    endif()
-    target_link_libraries(ply_odom PRIVATE OpenGL::GL)
+    set(HAVE_VIEWER ON)
     message(STATUS "ply_odom: viewer enabled")
   else()
     message(STATUS "ply_odom: SDL2 or OpenGL not found, building without viewer")
   endif()
 endif()
+
+function(target_add_viewer target)
+  if(NOT HAVE_VIEWER)
+    return()
+  endif()
+  target_compile_definitions(${target} PRIVATE PLY_ODOM_VIEWER)
+  if(TARGET SDL2::SDL2)
+    target_link_libraries(${target} PRIVATE SDL2::SDL2)
+  else() # older SDL2 packages only export variables
+    target_include_directories(${target} SYSTEM PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
+  endif()
+  target_link_libraries(${target} PRIVATE OpenGL::GL)
+endfunction()
+
+target_add_viewer(ply_odom)
 
 # eCAL 5 node. Needs eCAL 5 and protobuf (protoc); skipped when either is missing.
 # The foxglove .proto files are vendored in proto/ (from foxglove-sdk, MIT). To build
@@ -110,6 +120,7 @@ if(WITH_ECAL_NODE)
     add_executable(kiss_odom_node odom_node.cpp)
     target_link_libraries(kiss_odom_node PRIVATE kiss_icp_pipeline foxglove_proto eCAL::core
                                                  Threads::Threads)
+    target_add_viewer(kiss_odom_node) # for --viz
 
     if(NOT TARGET Eigen3::Eigen) # KISS-ICP found the system one inside its own scope
       find_package(Eigen3 REQUIRED NO_MODULE)

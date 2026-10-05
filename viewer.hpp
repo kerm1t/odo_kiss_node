@@ -126,6 +126,16 @@ public:
         data_dirty_ = true;
     }
 
+    // Drop all points and the trajectory (odometry started over). Keeps the camera
+    // and the colour range.
+    void clear() {
+        n_pts_ = 0;
+        traj_.clear();
+        has_pose_ = false;
+        pose_.setIdentity();
+        data_dirty_ = true;
+    }
+
     void setStatus(const std::string &s) {
         status_ = s;
         title_dirty_ = true;

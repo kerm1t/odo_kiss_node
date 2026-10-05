@@ -2,6 +2,7 @@
 //
 //   kiss_odom_node [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>]
 //                  [-r max_range_m] [-v voxel_m] [-p max_points_per_voxel] [-i max_icp_iterations] [-q]
+//                  [--viz] [-d vis_voxel_m]
 //
 // Output per input cloud, stamped with the cloud's timestamp:
 //   frame_id         odom frame (= sensor frame at the first cloud)
@@ -10,10 +11,15 @@
 //   linear/angular_velocity   per-epoch motion / dt, in the body frame
 //   metadata         fit, sigma, proc_ms, dropped
 //
-// Registration runs on the main thread. The receive callback only parses the
-// cloud into a single-slot buffer: if a new cloud arrives while the previous
-// one is still being registered, the older unprocessed one is dropped.
+// The receive callback only parses the cloud into a single-slot buffer: if a
+// new cloud arrives while the previous one is still being registered, the
+// older unprocessed one is dropped.
 // A timestamp going backwards (e.g. replay looping) resets the odometry.
+//
+// --viz opens the viewer (accumulated cloud + ego trajectory, see viewer.hpp
+// for controls). The viewer then owns the main thread and registration moves
+// to a worker thread; without --viz registration runs on the main thread.
+// Closing the window only closes the viewer, the node keeps running.
 
 #include <chrono>
 #include <cmath>
@@ -24,6 +30,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <ecal/ecal.h>
@@ -34,6 +41,12 @@
 #include "foxglove/PointCloud.pb.h"
 #include "kiss_odom.hpp"
 
+#ifdef PLY_ODOM_VIEWER
+#include "vis_feed.hpp"
+#else
+class VisFeed;  // only ever passed as a null pointer in a build without the viewer
+#endif
+
 using Cloud = KissOdom::Cloud;
 using Clock = std::chrono::steady_clock;
 
@@ -43,8 +56,10 @@ struct Args {
     std::string odom_frame = "odom";
     std::string body_frame;  // empty: use the cloud's frame_id
     KissOdom::Params odom;
-    double voxel = -1.0;  // default max_range / 100
+    double voxel = -1.0;      // default max_range / 100
+    double vis_voxel = -1.0;  // default voxel / 4
     bool quiet = false;
+    bool viz = false;
 };
 
 // One received cloud, parsed, waiting for registration.
@@ -123,7 +138,8 @@ static int usage(const char *argv0) {
     std::fprintf(stderr,
                  "usage: %s [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>]\n"
                  "       [-r max_range_m=100] [-v voxel_m=max_range/100] [-p max_points_per_voxel=20]\n"
-                 "       [-i max_icp_iterations=500] [-q (no per-frame log)]\n",
+                 "       [-i max_icp_iterations=500] [-q (no per-frame log)]\n"
+                 "       [--viz (show viewer)] [-d vis_voxel_m=voxel/4]\n",
                  argv0);
     return 1;
 }
@@ -149,13 +165,18 @@ int main(int argc, char **argv) {
             args.odom.max_points_per_voxel = std::atoi(argv[++i]);
         } else if (is("-i") && has_val) {
             args.odom.max_iterations = std::atoi(argv[++i]);
+        } else if (is("-d") && has_val) {
+            args.vis_voxel = std::atof(argv[++i]);
         } else if (is("-q")) {
             args.quiet = true;
+        } else if (is("--viz")) {
+            args.viz = true;
         } else {
             return usage(argv[0]);
         }
     }
     args.odom.voxel = args.voxel > 0.0 ? args.voxel : args.odom.max_range / 100.0;
+    if (args.vis_voxel <= 0.0) args.vis_voxel = args.odom.voxel / 4.0;
     if (args.odom.max_range <= 0.0 || args.odom.max_points_per_voxel < 1 ||
         args.odom.max_iterations < 1) {
         return usage(argv[0]);
@@ -210,98 +231,133 @@ int main(int argc, char **argv) {
     }
     std::fflush(stdout);
 
-    KissOdom odom(args.odom);
-    const double rad2deg = 180.0 / 3.14159265358979323846;
-    size_t n_frames = 0;
-    double last_stamp = -1.0;
+    // Registration loop. `feed` (may be null) gets every registered scan for the viewer.
+    const auto process = [&](VisFeed *feed) {
+        KissOdom odom(args.odom);
+        const double rad2deg = 180.0 / 3.14159265358979323846;
+        size_t n_frames = 0;
+        double last_stamp = -1.0;
+#ifndef PLY_ODOM_VIEWER
+        (void)feed;
+#endif
 
-    while (eCAL::Ok()) {
-        Pending p;
-        size_t n_dropped = 0;
-        {
-            std::unique_lock<std::mutex> lock(mtx);
-            cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return slot.valid; });
-            if (!slot.valid) continue;
-            p = std::move(slot);
-            slot.valid = false;
-            n_dropped = dropped;
-        }
-        if (p.cloud.empty()) {
-            std::fprintf(stderr, "empty point cloud, skipped\n");
-            continue;
-        }
-        if (last_stamp >= 0.0 && p.stamp < last_stamp) {
-            std::printf("timestamp went backwards (%.3f -> %.3f): odometry reset\n", last_stamp,
-                        p.stamp);
-            std::fflush(stdout);
-            odom.reset();
-        }
-        last_stamp = p.stamp;
-
-        const auto t0 = Clock::now();
-        const KissOdom::Result r = odom.registerFrame(p.cloud, p.stamp);
-        const double proc_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-        ++n_frames;
-
-        foxglove::Odometry msg;
-        *msg.mutable_timestamp() = p.ts;
-        msg.set_frame_id(args.odom_frame);
-        msg.set_body_frame_id(args.body_frame.empty() ? p.frame_id : args.body_frame);
-        const Eigen::Vector3d t = r.pose.translation();
-        const Eigen::Quaterniond q = r.pose.unit_quaternion();
-        auto *pos = msg.mutable_pose()->mutable_position();
-        pos->set_x(t.x());
-        pos->set_y(t.y());
-        pos->set_z(t.z());
-        auto *ori = msg.mutable_pose()->mutable_orientation();
-        ori->set_x(q.x());
-        ori->set_y(q.y());
-        ori->set_z(q.z());
-        ori->set_w(q.w());
-        if (!r.first && r.dt > 0.0) {  // body-frame twist over the last epoch
-            const Eigen::Matrix<double, 6, 1> twist = r.delta.log() / r.dt;
-            auto *lin = msg.mutable_linear_velocity();
-            lin->set_x(twist[0]);
-            lin->set_y(twist[1]);
-            lin->set_z(twist[2]);
-            auto *ang = msg.mutable_angular_velocity();
-            ang->set_x(twist[3]);
-            ang->set_y(twist[4]);
-            ang->set_z(twist[5]);
-        }
-        msg.mutable_pose_covariance()->Resize(36, 0.0);  // unknown
-        msg.mutable_velocity_covariance()->Resize(36, 0.0);
-        const auto meta = [&msg](const char *key, const std::string &value) {
-            auto *kv = msg.add_metadata();
-            kv->set_key(key);
-            kv->set_value(value);
-        };
-        meta("fit", std::to_string(r.fit));
-        meta("sigma", std::to_string(r.sigma));
-        meta("proc_ms", std::to_string(proc_ms));
-        meta("dropped", std::to_string(n_dropped));
-        pub.Send(msg);
-
-        // Process state for the eCAL monitor: warn when the registration looks poor.
-        char info[128];
-        std::snprintf(info, sizeof(info), "frame %zu, fit %.0f %%, %.0f ms, dropped %zu", n_frames,
-                      100.0 * r.fit, proc_ms, n_dropped);
-        eCAL::Process::SetState(r.first || r.fit >= 0.5 ? proc_sev_healthy : proc_sev_warning,
-                                proc_sev_level1, info);
-
-        if (!args.quiet) {
-            std::printf("%7zu %8zu ", n_frames, p.cloud.size());
-            if (r.first) {
-                std::printf("%8s %8s %6s ", "-", "-", "-");
-            } else {
-                std::printf("%8.3f %8.3f %6.1f ", r.delta.translation().norm(),
-                            r.delta.so3().log().norm() * rad2deg, 100.0 * r.fit);
+        while (eCAL::Ok()) {
+            Pending p;
+            size_t n_dropped = 0;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return slot.valid; });
+                if (!slot.valid) continue;
+                p = std::move(slot);
+                slot.valid = false;
+                n_dropped = dropped;
             }
-            std::printf("%7.1f %8.1f %7.1f %6zu %7zu %6.2f %7zu\n", r.ms_pre, r.ms_icp, r.ms_map,
-                        r.n_src, r.n_voxels, r.sigma, n_dropped);
-            std::fflush(stdout);
+            if (p.cloud.empty()) {
+                std::fprintf(stderr, "empty point cloud, skipped\n");
+                continue;
+            }
+            if (last_stamp >= 0.0 && p.stamp < last_stamp) {
+                std::printf("timestamp went backwards (%.3f -> %.3f): odometry reset\n", last_stamp,
+                            p.stamp);
+                std::fflush(stdout);
+                odom.reset();
+#ifdef PLY_ODOM_VIEWER
+                if (feed) feed->reset();
+#endif
+            }
+            last_stamp = p.stamp;
+
+            const auto t0 = Clock::now();
+            const KissOdom::Result r = odom.registerFrame(p.cloud, p.stamp);
+            const double proc_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            ++n_frames;
+
+            foxglove::Odometry msg;
+            *msg.mutable_timestamp() = p.ts;
+            msg.set_frame_id(args.odom_frame);
+            msg.set_body_frame_id(args.body_frame.empty() ? p.frame_id : args.body_frame);
+            const Eigen::Vector3d t = r.pose.translation();
+            const Eigen::Quaterniond q = r.pose.unit_quaternion();
+            auto *pos = msg.mutable_pose()->mutable_position();
+            pos->set_x(t.x());
+            pos->set_y(t.y());
+            pos->set_z(t.z());
+            auto *ori = msg.mutable_pose()->mutable_orientation();
+            ori->set_x(q.x());
+            ori->set_y(q.y());
+            ori->set_z(q.z());
+            ori->set_w(q.w());
+            if (!r.first && r.dt > 0.0) {  // body-frame twist over the last epoch
+                const Eigen::Matrix<double, 6, 1> twist = r.delta.log() / r.dt;
+                auto *lin = msg.mutable_linear_velocity();
+                lin->set_x(twist[0]);
+                lin->set_y(twist[1]);
+                lin->set_z(twist[2]);
+                auto *ang = msg.mutable_angular_velocity();
+                ang->set_x(twist[3]);
+                ang->set_y(twist[4]);
+                ang->set_z(twist[5]);
+            }
+            msg.mutable_pose_covariance()->Resize(36, 0.0);  // unknown
+            msg.mutable_velocity_covariance()->Resize(36, 0.0);
+            const auto meta = [&msg](const char *key, const std::string &value) {
+                auto *kv = msg.add_metadata();
+                kv->set_key(key);
+                kv->set_value(value);
+            };
+            meta("fit", std::to_string(r.fit));
+            meta("sigma", std::to_string(r.sigma));
+            meta("proc_ms", std::to_string(proc_ms));
+            meta("dropped", std::to_string(n_dropped));
+            pub.Send(msg);
+
+            // Process state for the eCAL monitor: warn when the registration looks poor.
+            char info[128];
+            std::snprintf(info, sizeof(info), "frame %zu, fit %.0f %%, %.0f ms, dropped %zu", n_frames,
+                          100.0 * r.fit, proc_ms, n_dropped);
+            eCAL::Process::SetState(r.first || r.fit >= 0.5 ? proc_sev_healthy : proc_sev_warning,
+                                    proc_sev_level1, info);
+#ifdef PLY_ODOM_VIEWER
+            if (feed) feed->push(r.frame, r.pose, info);
+#endif
+
+            if (!args.quiet) {
+                std::printf("%7zu %8zu ", n_frames, p.cloud.size());
+                if (r.first) {
+                    std::printf("%8s %8s %6s ", "-", "-", "-");
+                } else {
+                    std::printf("%8.3f %8.3f %6.1f ", r.delta.translation().norm(),
+                                r.delta.so3().log().norm() * rad2deg, 100.0 * r.fit);
+                }
+                std::printf("%7.1f %8.1f %7.1f %6zu %7zu %6.2f %7zu\n", r.ms_pre, r.ms_icp, r.ms_map,
+                            r.n_src, r.n_voxels, r.sigma, n_dropped);
+                std::fflush(stdout);
+            }
         }
+    };
+
+    if (args.viz) {
+#ifdef PLY_ODOM_VIEWER
+        // Keep Ctrl-C a plain SIGINT instead of an SDL "window closed" event.
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+        Viewer viewer;
+        if (viewer.init("kiss_odom_node")) {
+            VisFeed feed(args.vis_voxel);
+            viewer.setStatus("waiting for point clouds");
+            std::thread worker([&] { process(&feed); });
+            while (eCAL::Ok() && viewer.frame()) feed.drain(viewer);
+            feed.close();  // window closed: the node keeps running without the viewer
+            viewer.shutdown();
+            worker.join();
+            eCAL::Finalize();
+            return 0;
+        }
+        std::fprintf(stderr, "no viewer, running without\n");
+#else
+        std::fprintf(stderr, "--viz ignored: built without the viewer (SDL2 / OpenGL not found)\n");
+#endif
     }
+    process(nullptr);
 
     eCAL::Finalize();
     return 0;
