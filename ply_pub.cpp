@@ -1,5 +1,5 @@
 // ply_pub - replays a folder of PLY scans as foxglove.PointCloud on an eCAL 5
-// topic. Test input for kiss_odom_node.
+// topic. Test input for rt_odom.
 //
 //   ply_pub <dir | a.ply b.ply ...> [--out pointcloud] [--hz 10] [--rate <hz>] [--frame lidar] [--loop]
 //

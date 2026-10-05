@@ -1,8 +1,8 @@
-// kiss_odom_node - eCAL 5 node: foxglove.PointCloud in -> KISS-ICP -> foxglove.Odometry out.
+// rt_odom - eCAL 5 node: foxglove.PointCloud in -> KISS-ICP -> foxglove.Odometry out.
 //
-//   kiss_odom_node [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>]
-//                  [-r max_range_m] [-v voxel_m] [-p max_points_per_voxel] [-i max_icp_iterations] [-q]
-//                  [--viz] [-d vis_voxel_m] [--time-field auto|none|<name>] [--time-unit auto|s|ms|us|ns]
+//   rt_odom [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>]
+//           [-r max_range_m] [-v voxel_m] [-p max_points_per_voxel] [-i max_icp_iterations] [-q]
+//           [--viz] [-d vis_voxel_m] [--time-field auto|none|<name>] [--time-unit auto|s|ms|us|ns]
 //
 // Output per input cloud, stamped with the cloud's timestamp:
 //   frame_id         odom frame (= sensor frame at the first cloud)
@@ -292,7 +292,7 @@ int main(int argc, char **argv) {
         return usage(argv[0]);
     }
 
-    eCAL::Initialize(0, nullptr, "kiss_odom_node");
+    eCAL::Initialize(0, nullptr, "rt_odom");
     eCAL::Process::SetState(proc_sev_healthy, proc_sev_level1, "waiting for point clouds");
 
     // Single-slot hand-over from the receive callback to the main loop.
@@ -329,7 +329,7 @@ int main(int argc, char **argv) {
         cv.notify_one();
     });
 
-    std::printf("kiss_odom_node: '%s' (foxglove.PointCloud) -> '%s' (foxglove.Odometry)\n",
+    std::printf("rt_odom: '%s' (foxglove.PointCloud) -> '%s' (foxglove.Odometry)\n",
                 args.in.c_str(), args.out.c_str());
     std::printf("max_range %.1f m, voxel %.2f m, %d pts/voxel, max %d ICP iterations\n",
                 args.odom.max_range, args.odom.voxel, args.odom.max_points_per_voxel,
@@ -464,7 +464,7 @@ int main(int argc, char **argv) {
             eCAL::Process::SetState(r.first || r.fit >= 0.5 ? proc_sev_healthy : proc_sev_warning,
                                     proc_sev_level1, info);
 #ifdef PLY_ODOM_VIEWER
-            if (feed) feed->push(r.frame, r.pose, info);
+            if (feed) feed->push(r.frame, r.pose, p.stamp, info);
 #endif
 
             if (!args.quiet) {
@@ -487,7 +487,7 @@ int main(int argc, char **argv) {
         // Keep Ctrl-C a plain SIGINT instead of an SDL "window closed" event.
         SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
         Viewer viewer;
-        if (viewer.init("kiss_odom_node")) {
+        if (viewer.init("rt_odom")) {
             VisFeed feed(args.vis_voxel);
             viewer.setStatus("waiting for point clouds");
             std::thread worker([&] { process(&feed); });

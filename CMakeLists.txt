@@ -1,11 +1,11 @@
 # ply_odom: KISS-ICP odometry
 #   ply_odom        PLY folder -> trajectory file, optional SDL2 + OpenGL 3.3 viewer
-#   kiss_odom_node  eCAL 5 node: foxglove.PointCloud in -> foxglove.Odometry out
+#   rt_odom         eCAL 5 node: foxglove.PointCloud in -> foxglove.Odometry out
 #   ply_pub         replays a PLY folder as foxglove.PointCloud (test input for the node)
 #
 #   cmake -B build && cmake --build build -j
-#   ./build/ply_odom <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m] [-v voxel_m] [-p pts_per_voxel] [-i max_icp_iter] [-d vis_voxel_m] [-n]
-#   ./build/kiss_odom_node [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>] [-r ..] [-v ..] [-p ..] [-i ..] [-q] [--viz] [-d vis_voxel_m] [--time-field auto|none|<name>] [--time-unit auto|s|ms|us|ns]
+#   ./build/ply_odom <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m] [-v voxel_m] [-p pts_per_voxel] [-i max_icp_iter] [-d vis_voxel_m] [-f frame_rate_hz] [-n]
+#   ./build/rt_odom [--in pointcloud] [--out odometry] [--odom-frame odom] [--body-frame <id>] [-r ..] [-v ..] [-p ..] [-i ..] [-q] [--viz] [-d vis_voxel_m] [--time-field auto|none|<name>] [--time-unit auto|s|ms|us|ns]
 #   ./build/ply_pub <dir> [--out pointcloud] [--hz 10] [--rate <hz>] [--frame lidar] [--loop]
 cmake_minimum_required(VERSION 3.16...3.28)
 project(ply_odom LANGUAGES CXX)
@@ -117,10 +117,9 @@ if(WITH_ECAL_NODE)
     PROTOBUF_TARGET_CPP(foxglove_proto ${fg_proto_root} ${fg_protos}) # from eCAL's CMake helpers
     target_link_libraries(foxglove_proto PUBLIC protobuf::libprotobuf)
 
-    add_executable(kiss_odom_node odom_node.cpp)
-    target_link_libraries(kiss_odom_node PRIVATE kiss_icp_pipeline foxglove_proto eCAL::core
-                                                 Threads::Threads)
-    target_add_viewer(kiss_odom_node) # for --viz
+    add_executable(rt_odom rt_odom.cpp)
+    target_link_libraries(rt_odom PRIVATE kiss_icp_pipeline foxglove_proto eCAL::core Threads::Threads)
+    target_add_viewer(rt_odom) # for --viz
 
     if(NOT TARGET Eigen3::Eigen) # KISS-ICP found the system one inside its own scope
       find_package(Eigen3 REQUIRED NO_MODULE)

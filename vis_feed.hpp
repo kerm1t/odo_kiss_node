@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -71,12 +72,13 @@ public:
     explicit VisFeed(double vis_voxel) : acc_(vis_voxel) {}
 
     // A registered scan (sensor frame) with its pose in the odometry frame.
-    void push(const Cloud &frame, const Sophus::SE3d &T, const std::string &status) {
+    // `stamp` in seconds, < 0 if unknown (then the viewer shows no velocity).
+    void push(const Cloud &frame, const Sophus::SE3d &T, double stamp, const std::string &status) {
         if (closed()) return;
         const std::vector<float> fresh = acc_.add(frame, T);
         std::lock_guard<std::mutex> lock(m_);
         pts_.insert(pts_.end(), fresh.begin(), fresh.end());
-        poses_.push_back(T.matrix().cast<float>());
+        poses_.emplace_back(T.matrix().cast<float>(), stamp);
         status_ = status;
         dirty_ = true;
     }
@@ -108,7 +110,7 @@ public:
     // Move whatever arrived into the viewer and update its title.
     void drain(Viewer &viewer) {
         std::vector<float> pts;
-        std::vector<Eigen::Matrix4f> poses;
+        std::vector<std::pair<Eigen::Matrix4f, double>> poses;
         std::string status;
         bool reset = false;
         {
@@ -122,7 +124,7 @@ public:
         }
         if (reset) viewer.clear();
         viewer.addPoints(pts);
-        for (const auto &T : poses) viewer.addPose(T);
+        for (const auto &p : poses) viewer.addPose(p.first, p.second);
         char n_pts[48];
         std::snprintf(n_pts, sizeof(n_pts), "  |  %.2f M pts",
                       static_cast<double>(viewer.numPoints()) / 1.0e6);
@@ -138,7 +140,7 @@ private:
     VisAccumulator acc_;  // odometry thread only
     std::mutex m_;
     std::vector<float> pts_;
-    std::vector<Eigen::Matrix4f> poses_;
+    std::vector<std::pair<Eigen::Matrix4f, double>> poses_;
     std::string status_;
     bool dirty_ = false, reset_ = false, closed_ = false;
 };

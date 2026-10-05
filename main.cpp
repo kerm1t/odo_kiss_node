@@ -1,7 +1,7 @@
 // ply_odom - KISS-ICP odometry over a sequence of PLY scans, with live viewer.
 //
 //   ply_odom <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m] [-v voxel_m]
-//            [-p max_points_per_voxel] [-i max_icp_iterations] [-d vis_voxel_m] [-n]
+//            [-p max_points_per_voxel] [-i max_icp_iterations] [-d vis_voxel_m] [-f frame_rate_hz] [-n]
 //
 // A directory is scanned for *.ply and sorted naturally (frame_2 < frame_10);
 // files given explicitly keep their order. Writes one pose per frame in KITTI
@@ -10,6 +10,8 @@
 //
 // Viewer (SDL2 + OpenGL 3.3, see viewer.hpp for controls) shows the accumulated
 // cloud in the first frame's coordinates plus the ego trajectory. -n disables it.
+// PLY files carry no time, so velocity and acceleration in the viewer need the
+// frame rate of the recording: -f <hz>.
 
 #include <algorithm>
 #include <atomic>
@@ -48,12 +50,14 @@ struct Options {
     double vis_voxel = -1.0;  // default voxel / 4
     int max_points_per_voxel = KissOdom::Params().max_points_per_voxel;
     int max_iterations = KissOdom::Params().max_iterations;
+    double frame_hz = -1.0;   // frame rate of the recording, < 0 if unknown
     bool viewer = true;
 };
 
 // Called once per registered frame: range-cropped scan (sensor frame), its
-// pose in the first frame, number of frames done, number of input files.
-using FrameSink = std::function<void(const Cloud &, const Sophus::SE3d &, size_t, size_t)>;
+// pose in the first frame, its time in seconds (< 0 if unknown), number of
+// frames done.
+using FrameSink = std::function<void(const Cloud &, const Sophus::SE3d &, double, size_t)>;
 
 static double msSince(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -109,7 +113,8 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
 
         // First frame only seeds the map (pose = identity). Later frames are
         // registered against it, initial guess = constant-velocity prediction.
-        const KissOdom::Result r = odom.registerFrame(cloud);
+        const double stamp = opt.frame_hz > 0.0 ? static_cast<double>(i) / opt.frame_hz : -1.0;
+        const KissOdom::Result r = odom.registerFrame(cloud, stamp);
         pose = r.pose;
 
         const Eigen::Matrix<double, 3, 4> M = r.pose.matrix3x4();
@@ -122,7 +127,7 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
 
         const double step = r.delta.translation().norm();
         path_len += step;
-        if (sink) sink(r.frame, r.pose, i + 1, files.size());
+        if (sink) sink(r.frame, r.pose, stamp, i + 1);
 
         std::printf("%4zu/%-4zu  %-22s %8zu ", i + 1, files.size(), name.c_str(), cloud.size());
         if (r.first) {
@@ -171,8 +176,8 @@ static int runWithViewer(const Options &opt, Viewer &viewer) {
         size_t last = 0;
         n_ok = runOdometry(
             opt,
-            [&](const Cloud &frame, const Sophus::SE3d &T, size_t done, size_t) {
-                feed.push(frame, T, status(done, false));
+            [&](const Cloud &frame, const Sophus::SE3d &T, double stamp, size_t done) {
+                feed.push(frame, T, stamp, status(done, false));
                 last = done;
             },
             stop);
@@ -190,7 +195,8 @@ static int usage(const char *argv0) {
     std::fprintf(stderr,
                  "usage: %s <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m=100]\n"
                  "       [-v voxel_m=max_range/100] [-p max_points_per_voxel=20]\n"
-                 "       [-i max_icp_iterations=500] [-d vis_voxel_m=voxel/4] [-n (no viewer)]\n",
+                 "       [-i max_icp_iterations=500] [-d vis_voxel_m=voxel/4] [-n (no viewer)]\n"
+                 "       [-f frame_rate_hz (for velocity in the viewer)]\n",
                  argv0);
     return 1;
 }
@@ -209,6 +215,8 @@ int main(int argc, char **argv) {
             opt.max_points_per_voxel = std::atoi(argv[++i]);
         } else if (!std::strcmp(argv[i], "-i") && has_val) {
             opt.max_iterations = std::atoi(argv[++i]);
+        } else if (!std::strcmp(argv[i], "-f") && has_val) {
+            opt.frame_hz = std::atof(argv[++i]);
         } else if (!std::strcmp(argv[i], "-d") && has_val) {
             opt.vis_voxel = std::atof(argv[++i]);
         } else if (!std::strcmp(argv[i], "-n")) {
