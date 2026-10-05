@@ -1,7 +1,7 @@
 // ply_odom - KISS-ICP odometry over a sequence of PLY scans, with live viewer.
 //
 //   ply_odom <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m] [-v voxel_m]
-//            [-d vis_voxel_m] [-n]
+//            [-p max_points_per_voxel] [-i max_icp_iterations] [-d vis_voxel_m] [-n]
 //
 // A directory is scanned for *.ply and sorted naturally (frame_2 < frame_10);
 // files given explicitly keep their order. Writes one pose per frame in KITTI
@@ -32,16 +32,17 @@
 #include <vector>
 
 #include <Eigen/Core>
-#include <happly.h>
 #include <kiss_icp/core/VoxelUtils.hpp>
-#include <kiss_icp/pipeline/KissICP.hpp>
+
+#include "kiss_odom.hpp"
+#include "ply_io.hpp"
 
 #ifdef PLY_ODOM_VIEWER
 #include "viewer.hpp"
 #endif
 
 namespace fs = std::filesystem;
-using Cloud = std::vector<Eigen::Vector3d>;
+using Cloud = KissOdom::Cloud;
 using Clock = std::chrono::steady_clock;
 
 struct Options {
@@ -50,6 +51,8 @@ struct Options {
     double max_range = 100.0;
     double voxel = -1.0;      // default max_range / 100
     double vis_voxel = -1.0;  // default voxel / 4
+    int max_points_per_voxel = KissOdom::Params().max_points_per_voxel;
+    int max_iterations = KissOdom::Params().max_iterations;
     bool viewer = true;
 };
 
@@ -61,71 +64,6 @@ static double msSince(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
-static Cloud loadPly(const std::string &path) {
-    happly::PLYData ply(path);
-    const auto v = ply.getVertexPositions();  // float or double x/y/z
-    Cloud pts;
-    pts.reserve(v.size());
-    for (const auto &p : v) {
-        if (std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2])) {
-            pts.emplace_back(p[0], p[1], p[2]);
-        }
-    }
-    return pts;
-}
-
-// "frame_2" < "frame_10": digit runs compare by value.
-static bool naturalLess(const std::string &a, const std::string &b) {
-    const auto dig = [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; };
-    size_t i = 0, j = 0;
-    while (i < a.size() && j < b.size()) {
-        if (dig(a[i]) && dig(b[j])) {
-            size_t ie = i, je = j;
-            while (ie < a.size() && dig(a[ie])) ++ie;
-            while (je < b.size() && dig(b[je])) ++je;
-            while (i + 1 < ie && a[i] == '0') ++i;  // leading zeros
-            while (j + 1 < je && b[j] == '0') ++j;
-            if (ie - i != je - j) return ie - i < je - j;
-            const int c = a.compare(i, ie - i, b, j, je - j);
-            if (c != 0) return c < 0;
-            i = ie;
-            j = je;
-        } else {
-            if (a[i] != b[j]) return a[i] < b[j];
-            ++i;
-            ++j;
-        }
-    }
-    return a.size() - i < b.size() - j;
-}
-
-static std::vector<std::string> listPly(const fs::path &dir) {
-    std::vector<std::string> files;
-    for (const auto &e : fs::directory_iterator(dir)) {
-        if (!e.is_regular_file()) continue;
-        std::string ext = e.path().extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ext == ".ply") files.push_back(e.path().string());
-    }
-    std::sort(files.begin(), files.end(), naturalLess);
-    return files;
-}
-
-// Rough alignment check: share of `src` points (moved by T) with a neighbour
-// in `map` closer than `max_dist`.
-static double inlierShare(const Cloud &src,
-                          const Sophus::SE3d &T,
-                          const kiss_icp::VoxelHashMap &map,
-                          double max_dist) {
-    if (src.empty()) return 0.0;
-    size_t n = 0;
-    for (const auto &p : src) {
-        if (std::get<1>(map.GetClosestNeighbor(T * p)) < max_dist) ++n;
-    }
-    return static_cast<double>(n) / static_cast<double>(src.size());
-}
-
 // Runs the whole sequence, writes the trajectory, prints the log.
 // Returns the number of poses written.
 static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::atomic<bool> &stop) {
@@ -135,25 +73,29 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
         return 0;
     }
 
-    kiss_icp::pipeline::KISSConfig cfg;
-    cfg.max_range = opt.max_range;
-    cfg.voxel_size = opt.voxel;
-    cfg.deskew = false;  // no per-point timestamps in the PLYs
-    kiss_icp::pipeline::KissICP odom(cfg);
-    const std::vector<double> no_stamps;
+    KissOdom::Params params;
+    params.max_range = opt.max_range;
+    params.voxel = opt.voxel;
+    params.max_points_per_voxel = opt.max_points_per_voxel;
+    params.max_iterations = opt.max_iterations;
+    KissOdom odom(params);
     const auto &files = opt.files;
 
-    std::printf("%zu files, max_range %.1f m, voxel %.2f m\n", files.size(), opt.max_range,
-                opt.voxel);
-    // odom[ms] = KISS-ICP RegisterFrame only, frame[ms] = whole iteration
-    // (load, registration, fit check, viewer accumulation).
-    std::printf("%9s  %-28s %9s %9s %9s %7s %9s %9s\n", "frame", "file", "points", "step[m]",
-                "rot[deg]", "fit[%]", "odom[ms]", "frame[ms]");
+    std::printf("%zu files, max_range %.1f m, voxel %.2f m, %d pts/voxel, max %d ICP iterations\n",
+                files.size(), params.max_range, params.voxel, params.max_points_per_voxel,
+                params.max_iterations);
+    // pre = range crop + downsampling, icp = registration, map = local map update,
+    // frame = whole iteration incl. PLY load, fit check and viewer accumulation.
+    // src = points used for ICP, vox = voxels in the local map, sigma = adaptive threshold.
+    std::printf("%9s  %-22s %8s %8s %8s %6s %7s %8s %7s %8s %6s %7s %6s\n", "frame", "file",
+                "points", "step[m]", "rot[deg]", "fit[%]", "pre[ms]", "icp[ms]", "map[ms]",
+                "frame[ms]", "src", "vox", "sigma");
 
     const double rad2deg = 180.0 / 3.14159265358979323846;
     const auto t_total = Clock::now();
     size_t n_ok = 0;
     double path_len = 0.0;
+    Sophus::SE3d pose;
 
     for (size_t i = 0; i < files.size() && !stop; ++i) {
         const auto t_frame = Clock::now();
@@ -170,37 +112,32 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
             continue;
         }
 
-        // Map as it was before this frame went in, for the fit check.
-        const kiss_icp::VoxelHashMap map_prev = odom.VoxelMap();
-
         // First frame only seeds the map (pose = identity). Later frames are
         // registered against it, initial guess = constant-velocity prediction.
-        const auto t0 = Clock::now();
-        const auto [frame, src] = odom.RegisterFrame(cloud, no_stamps);
-        const double ms = msSince(t0);
+        const KissOdom::Result r = odom.registerFrame(cloud);
+        pose = r.pose;
 
-        const Sophus::SE3d T = odom.pose();
-        const Sophus::SE3d d = odom.delta();
-        const Eigen::Matrix<double, 3, 4> M = T.matrix3x4();
-        for (int r = 0; r < 3; ++r) {
+        const Eigen::Matrix<double, 3, 4> M = r.pose.matrix3x4();
+        for (int row = 0; row < 3; ++row) {
             for (int c = 0; c < 4; ++c) {
-                std::fprintf(out, "%.9g%c", M(r, c), (r == 2 && c == 3) ? '\n' : ' ');
+                std::fprintf(out, "%.9g%c", M(row, c), (row == 2 && c == 3) ? '\n' : ' ');
             }
         }
         std::fflush(out);
 
-        const double step = d.translation().norm();
-        const double fit = n_ok == 0 ? 0.0 : 100.0 * inlierShare(src, T, map_prev, opt.voxel);
+        const double step = r.delta.translation().norm();
         path_len += step;
-        if (sink) sink(frame, T, i + 1, files.size());
+        if (sink) sink(r.frame, r.pose, i + 1, files.size());
 
-        std::printf("%4zu/%-4zu  %-28s %9zu ", i + 1, files.size(), name.c_str(), cloud.size());
-        if (n_ok == 0) {
-            std::printf("%9s %9s %7s %9.1f %9.1f\n", "-", "-", "-", ms, msSince(t_frame));
+        std::printf("%4zu/%-4zu  %-22s %8zu ", i + 1, files.size(), name.c_str(), cloud.size());
+        if (r.first) {
+            std::printf("%8s %8s %6s ", "-", "-", "-");
         } else {
-            std::printf("%9.3f %9.3f %7.1f %9.1f %9.1f\n", step, d.so3().log().norm() * rad2deg,
-                        fit, ms, msSince(t_frame));
+            std::printf("%8.3f %8.3f %6.1f ", step, r.delta.so3().log().norm() * rad2deg,
+                        100.0 * r.fit);
         }
+        std::printf("%7.1f %8.1f %7.1f %8.1f %6zu %7zu %6.2f\n", r.ms_pre, r.ms_icp, r.ms_map,
+                    msSince(t_frame), r.n_src, r.n_voxels, r.sigma);
         std::fflush(stdout);
         ++n_ok;
     }
@@ -211,7 +148,7 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
         std::fprintf(stderr, "fewer than 2 usable frames, no trajectory\n");
         return n_ok;
     }
-    const Eigen::Matrix4d M = odom.pose().matrix();
+    const Eigen::Matrix4d M = pose.matrix();
     std::printf("\n%zu poses -> %s  (path %.2f m, %.1f s)\n", n_ok, opt.out_path.c_str(), path_len,
                 msSince(t_total) / 1000.0);
     std::printf("final pose T_0_n:\n");
@@ -325,7 +262,8 @@ static int runWithViewer(const Options &opt, Viewer &viewer) {
 static int usage(const char *argv0) {
     std::fprintf(stderr,
                  "usage: %s <dir | a.ply b.ply ...> [-o traj.txt] [-r max_range_m=100]\n"
-                 "       [-v voxel_m=max_range/100] [-d vis_voxel_m=voxel/4] [-n (no viewer)]\n",
+                 "       [-v voxel_m=max_range/100] [-p max_points_per_voxel=20]\n"
+                 "       [-i max_icp_iterations=500] [-d vis_voxel_m=voxel/4] [-n (no viewer)]\n",
                  argv0);
     return 1;
 }
@@ -340,6 +278,10 @@ int main(int argc, char **argv) {
             opt.max_range = std::atof(argv[++i]);
         } else if (!std::strcmp(argv[i], "-v") && has_val) {
             opt.voxel = std::atof(argv[++i]);
+        } else if (!std::strcmp(argv[i], "-p") && has_val) {
+            opt.max_points_per_voxel = std::atoi(argv[++i]);
+        } else if (!std::strcmp(argv[i], "-i") && has_val) {
+            opt.max_iterations = std::atoi(argv[++i]);
         } else if (!std::strcmp(argv[i], "-d") && has_val) {
             opt.vis_voxel = std::atof(argv[++i]);
         } else if (!std::strcmp(argv[i], "-n")) {
@@ -355,7 +297,10 @@ int main(int argc, char **argv) {
     }
     if (opt.voxel < 0.0) opt.voxel = opt.max_range / 100.0;
     if (opt.vis_voxel < 0.0) opt.vis_voxel = opt.voxel / 4.0;
-    if (opt.max_range <= 0.0 || opt.voxel <= 0.0 || opt.vis_voxel <= 0.0) return usage(argv[0]);
+    if (opt.max_range <= 0.0 || opt.voxel <= 0.0 || opt.vis_voxel <= 0.0 ||
+        opt.max_points_per_voxel < 1 || opt.max_iterations < 1) {
+        return usage(argv[0]);
+    }
     if (opt.files.size() < 2) {
         std::fprintf(stderr, "need at least 2 PLY files (got %zu)\n", opt.files.size());
         return usage(argv[0]);
