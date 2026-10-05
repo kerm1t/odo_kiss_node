@@ -1,25 +1,32 @@
-cmake_minimum_required(VERSION 3.16)
-project(odo_kiss CXX)
+# ply_odom: relative pose between two PLY scans with KISS-ICP
+#   cmake -B build && cmake --build build -j
+#   ./build/ply_odom a.ply b.ply
+cmake_minimum_required(VERSION 3.16...3.28)
+project(ply_odom LANGUAGES CXX)
 
-# KISS-ICP benötigt zwingend C++17
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# --- 1. Abhängigkeiten von KISS-ICP im System finden ---
-find_package(Eigen3 REQUIRED)
-find_package(TBB REQUIRED) # Für Parallelisierung
+include(FetchContent)
 
-# --- 2. KISS-ICP als Subprojekt hinzufügen ---
-# Wir weisen CMake an, direkt in den cpp-Ordner von KISS-ICP zu schauen
-add_subdirectory(thirdparty/kiss_icp ${CMAKE_CURRENT_BINARY_DIR}/kiss_icp)
+# KISS-ICP C++ core + pipeline. Uses system Eigen3 / Sophus / TBB / tsl-robin-map
+# when found, otherwise fetches them itself.
+FetchContent_Declare(kiss_icp
+  GIT_REPOSITORY https://github.com/PRBonn/kiss-icp.git
+  GIT_TAG        v1.3.0
+  GIT_SHALLOW    ON
+  SOURCE_SUBDIR  cpp/kiss_icp)
 
-include_directories(thirdparty)
+# happly: single header, no CMake project of its own
+FetchContent_Declare(happly
+  GIT_REPOSITORY https://github.com/nmwsharp/happly.git
+  GIT_TAG        ed5480454d15e5287370eadc3682e9d40ba395e1)
 
-# --- 3. Eigenes Executable erstellen ---
-add_executable(mein_programm src/main.cpp)
+FetchContent_MakeAvailable(kiss_icp happly)
 
-# --- 4. Mit KISS-ICP verlinken ---
-# Das Target 'kiss_icp::kiss_icp' wird vom Subprojekt bereitgestellt
-# target_link_libraries(mein_programm PRIVATE kiss_icp::kiss_icp)
-#target_link_libraries(mein_programm PRIVATE kiss_icp Eigen3::Eigen sophus)
-target_link_libraries(mein_programm PRIVATE kiss_icp_pipeline Eigen3::Eigen sophus)
+add_executable(ply_odom main.cpp)
+target_include_directories(ply_odom SYSTEM PRIVATE ${happly_SOURCE_DIR})
+target_link_libraries(ply_odom PRIVATE kiss_icp_pipeline)
