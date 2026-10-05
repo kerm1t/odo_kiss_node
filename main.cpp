@@ -12,6 +12,7 @@
 // cloud in the first frame's coordinates plus the ego trajectory. -n disables it.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -27,7 +28,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Core>
@@ -144,8 +145,10 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
 
     std::printf("%zu files, max_range %.1f m, voxel %.2f m\n", files.size(), opt.max_range,
                 opt.voxel);
-    std::printf("%9s  %-28s %9s %9s %9s %7s %8s\n", "frame", "file", "points", "step[m]",
-                "rot[deg]", "fit[%]", "ms");
+    // odom[ms] = KISS-ICP RegisterFrame only, frame[ms] = whole iteration
+    // (load, registration, fit check, viewer accumulation).
+    std::printf("%9s  %-28s %9s %9s %9s %7s %9s %9s\n", "frame", "file", "points", "step[m]",
+                "rot[deg]", "fit[%]", "odom[ms]", "frame[ms]");
 
     const double rad2deg = 180.0 / 3.14159265358979323846;
     const auto t_total = Clock::now();
@@ -153,6 +156,7 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
     double path_len = 0.0;
 
     for (size_t i = 0; i < files.size() && !stop; ++i) {
+        const auto t_frame = Clock::now();
         const std::string name = fs::path(files[i]).filename().string();
         Cloud cloud;
         try {
@@ -186,17 +190,19 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
         std::fflush(out);
 
         const double step = d.translation().norm();
+        const double fit = n_ok == 0 ? 0.0 : 100.0 * inlierShare(src, T, map_prev, opt.voxel);
         path_len += step;
+        if (sink) sink(frame, T, i + 1, files.size());
+
         std::printf("%4zu/%-4zu  %-28s %9zu ", i + 1, files.size(), name.c_str(), cloud.size());
         if (n_ok == 0) {
-            std::printf("%9s %9s %7s %8.1f\n", "-", "-", "-", ms);
+            std::printf("%9s %9s %7s %9.1f %9.1f\n", "-", "-", "-", ms, msSince(t_frame));
         } else {
-            std::printf("%9.3f %9.3f %7.1f %8.1f\n", step, d.so3().log().norm() * rad2deg,
-                        100.0 * inlierShare(src, T, map_prev, opt.voxel), ms);
+            std::printf("%9.3f %9.3f %7.1f %9.1f %9.1f\n", step, d.so3().log().norm() * rad2deg,
+                        fit, ms, msSince(t_frame));
         }
         std::fflush(stdout);
         ++n_ok;
-        if (sink) sink(frame, T, i + 1, files.size());
     }
     std::fclose(out);
 
@@ -219,6 +225,8 @@ static size_t runOdometry(const Options &opt, const FrameSink &sink, const std::
 #ifdef PLY_ODOM_VIEWER
 // Accumulates scans for display: one point per vis voxel, world-wide, so the
 // buffer grows with covered area and not with the number of frames.
+// Occupancy is kept as one bit per voxel in 8x8x8 blocks (64 bytes per block),
+// which costs a few bytes per stored point instead of ~40 for a hash set of keys.
 class VisAccumulator {
 public:
     explicit VisAccumulator(double voxel) : voxel_(voxel) {}
@@ -229,7 +237,7 @@ public:
         std::vector<float> out;
         for (const auto &p : kiss_icp::VoxelDownsample(frame, voxel_)) {
             const Eigen::Vector3d w = T * p;
-            if (!seen_.insert(key(w)).second) continue;
+            if (!markNew(w)) continue;
             out.insert(out.end(), {static_cast<float>(w.x()), static_cast<float>(w.y()),
                                    static_cast<float>(w.z()), static_cast<float>(p.z())});
         }
@@ -237,16 +245,23 @@ public:
     }
 
 private:
-    uint64_t key(const Eigen::Vector3d &w) const {
-        const auto q = [this](double v) {
-            return static_cast<uint64_t>(static_cast<int64_t>(std::floor(v / voxel_)) + (1 << 20)) &
-                   0x1FFFFF;
-        };
-        return (q(w.x()) << 42) | (q(w.y()) << 21) | q(w.z());
+    // Sets the voxel's bit; true if it was not set before.
+    bool markNew(const Eigen::Vector3d &w) {
+        const int64_t ix = static_cast<int64_t>(std::floor(w.x() / voxel_));
+        const int64_t iy = static_cast<int64_t>(std::floor(w.y() / voxel_));
+        const int64_t iz = static_cast<int64_t>(std::floor(w.z() / voxel_));
+        const auto q = [](int64_t v) { return static_cast<uint64_t>((v >> 3) + (1 << 20)) & 0x1FFFFF; };
+        const uint64_t block = (q(ix) << 42) | (q(iy) << 21) | q(iz);
+        const unsigned bit = static_cast<unsigned>(((ix & 7) << 6) | ((iy & 7) << 3) | (iz & 7));
+        uint64_t &word = blocks_[block][bit >> 6];  // new blocks start zeroed
+        const uint64_t mask = uint64_t{1} << (bit & 63);
+        if (word & mask) return false;
+        word |= mask;
+        return true;
     }
 
     double voxel_;
-    std::unordered_set<uint64_t> seen_;
+    std::unordered_map<uint64_t, std::array<uint64_t, 8>> blocks_;
 };
 
 // Odometry runs in a worker thread, the viewer on the main thread.

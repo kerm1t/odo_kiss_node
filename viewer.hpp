@@ -8,6 +8,11 @@
 //   Esc / Q     quit
 //
 // World is z-up. Points are (x, y, z, s) with s = scalar used for colouring.
+//
+// Cost control: the cloud only grows, so the viewer redraws on demand instead
+// of every display frame - immediately on input, and for new data at most
+// ~20 % of the time (measured draw cost). While dragging, a subsampled cloud
+// is drawn. Points live in the GPU buffer only (no CPU copy).
 #pragma once
 
 #define SDL_MAIN_HANDLED
@@ -85,20 +90,29 @@ public:
     void addPoints(const std::vector<float> &xyzs) {
         if (xyzs.empty()) return;
         if (!range_set_) setRangeFrom(xyzs);
-        const size_t old_bytes = pts_.size() * sizeof(float);
-        pts_.insert(pts_.end(), xyzs.begin(), xyzs.end());
-        const size_t bytes = pts_.size() * sizeof(float);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_pts_);
-        if (bytes > cap_bytes_) {  // grow x2 and re-upload everything
-            cap_bytes_ = std::max(bytes, 2 * cap_bytes_);
-            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(cap_bytes_), nullptr,
+        const size_t old_bytes = n_pts_ * kStride;
+        const size_t add_bytes = xyzs.size() * sizeof(float);
+        if (old_bytes + add_bytes > cap_bytes_) {  // grow x2, copy GPU -> GPU
+            const size_t cap = std::max({old_bytes + add_bytes, 2 * cap_bytes_, size_t{16} << 20});
+            GLuint nb = 0;
+            glGenBuffers(1, &nb);
+            glBindBuffer(GL_COPY_WRITE_BUFFER, nb);
+            glBufferData(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(cap), nullptr,
                          GL_DYNAMIC_DRAW);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(bytes), pts_.data());
-        } else {
-            glBufferSubData(GL_ARRAY_BUFFER, static_cast<GLintptr>(old_bytes),
-                            static_cast<GLsizeiptr>(bytes - old_bytes),
-                            pts_.data() + old_bytes / sizeof(float));
+            if (old_bytes > 0) {
+                glBindBuffer(GL_COPY_READ_BUFFER, vbo_pts_);
+                glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0,
+                                    static_cast<GLsizeiptr>(old_bytes));
+            }
+            glDeleteBuffers(1, &vbo_pts_);
+            vbo_pts_ = nb;  // attribute pointer is re-set at draw time
+            cap_bytes_ = cap;
         }
+        glBindBuffer(GL_ARRAY_BUFFER, vbo_pts_);
+        glBufferSubData(GL_ARRAY_BUFFER, static_cast<GLintptr>(old_bytes),
+                        static_cast<GLsizeiptr>(add_bytes), xyzs.data());
+        n_pts_ += xyzs.size() / 4;
+        data_dirty_ = true;
     }
 
     // Append an ego pose (sensor in world). Extends the trajectory.
@@ -109,6 +123,7 @@ public:
         glBindBuffer(GL_ARRAY_BUFFER, vbo_traj_);
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(traj_.size() * sizeof(float)),
                      traj_.data(), GL_DYNAMIC_DRAW);
+        data_dirty_ = true;
     }
 
     void setStatus(const std::string &s) {
@@ -116,15 +131,23 @@ public:
         title_dirty_ = true;
     }
 
-    size_t numPoints() const { return pts_.size() / 4; }
+    size_t numPoints() const { return n_pts_; }
 
-    // Handle input, draw, swap. Returns false once the user wants to quit.
+    // Handle input and redraw if needed, otherwise sleep a few ms.
+    // Returns false once the user wants to quit.
     bool frame() {
         if (!handleEvents()) return false;
         if (title_dirty_) {
             SDL_SetWindowTitle(win_, (title_ + "  |  " + status_ + (follow_ ? "  |  follow" : ""))
                                          .c_str());
             title_dirty_ = false;
+        }
+
+        const Uint32 t_start = SDL_GetTicks();
+        const bool data_due = data_dirty_ && SDL_TICKS_PASSED(t_start, next_data_draw_);
+        if (!view_dirty_ && !data_due) {
+            SDL_Delay(5);
+            return true;
         }
         if (follow_ && has_pose_) target_ = pose_.block<3, 1>(0, 3);
 
@@ -150,8 +173,15 @@ public:
         glEnable(GL_DEPTH_TEST);
         glUniform4f(u_flat_, 0, 0, 0, 0);
         glUniform1f(u_psize_, psize_);
+        // While dragging draw every k-th point only (points arrive unordered
+        // within a scan, so a stride thins the cloud evenly).
+        const size_t k =
+            dragging_ ? std::max<size_t>((n_pts_ + kDragBudget - 1) / kDragBudget, 1) : 1;
         glBindVertexArray(vao_pts_);
-        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(pts_.size() / 4));
+        glBindBuffer(GL_ARRAY_BUFFER, vbo_pts_);
+        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(k * kStride),
+                              nullptr);
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(n_pts_ / k));
 
         // trajectory + ego axes on top
         glDisable(GL_DEPTH_TEST);
@@ -186,12 +216,14 @@ public:
             }
         }
         glBindVertexArray(0);
-        SDL_GL_SwapWindow(win_);
 
-        // cap at ~60 fps in case vsync is off, so the odometry thread keeps its cores
-        const Uint32 dt = SDL_GetTicks() - last_tick_;
-        if (dt < 16) SDL_Delay(16 - dt);
-        last_tick_ = SDL_GetTicks();
+        // Measure what this draw really cost and hold back data-driven redraws
+        // so they take at most ~20 % of the time; input redraws are not held back.
+        glFinish();
+        const Uint32 cost = SDL_GetTicks() - t_start;
+        SDL_GL_SwapWindow(win_);
+        view_dirty_ = data_dirty_ = false;
+        next_data_draw_ = SDL_GetTicks() + 4 * cost;
         return true;
     }
 
@@ -223,6 +255,7 @@ private:
         dist_ = 80.0f;
         follow_ = true;
         title_dirty_ = true;
+        view_dirty_ = true;
     }
 
     bool handleEvents() {
@@ -231,7 +264,16 @@ private:
             switch (e.type) {
                 case SDL_QUIT:
                     return false;
+                case SDL_WINDOWEVENT:  // exposed, resized, ...
+                    view_dirty_ = true;
+                    break;
+                case SDL_MOUSEBUTTONDOWN:
+                case SDL_MOUSEBUTTONUP:
+                    dragging_ = SDL_GetMouseState(nullptr, nullptr) != 0;
+                    view_dirty_ = true;  // full-detail redraw on release
+                    break;
                 case SDL_KEYDOWN:
+                    view_dirty_ = true;
                     switch (e.key.keysym.sym) {
                         case SDLK_ESCAPE:
                         case SDLK_q:
@@ -259,6 +301,7 @@ private:
                 case SDL_MOUSEWHEEL:
                     dist_ = std::clamp(dist_ * std::exp(-0.12f * static_cast<float>(e.wheel.y)),
                                        0.5f, 5000.0f);
+                    view_dirty_ = true;
                     break;
                 case SDL_MOUSEMOTION: {
                     const float dx = static_cast<float>(e.motion.xrel);
@@ -266,6 +309,7 @@ private:
                     if (e.motion.state & SDL_BUTTON_LMASK) {
                         yaw_ -= 0.005f * dx;
                         pitch_ = std::clamp(pitch_ + 0.005f * dy, -1.55f, 1.55f);
+                        view_dirty_ = true;
                     } else if (e.motion.state & (SDL_BUTTON_RMASK | SDL_BUTTON_MMASK)) {
                         // pan in the ground plane, like dragging a map
                         const Eigen::Vector3f fwd(-std::cos(yaw_), -std::sin(yaw_), 0.0f);
@@ -273,6 +317,7 @@ private:
                         target_ += (fwd * dy - right * dx) * dist_ * 0.0015f;
                         if (follow_) title_dirty_ = true;
                         follow_ = false;
+                        view_dirty_ = true;
                     }
                     break;
                 }
@@ -395,15 +440,22 @@ void main() { frag = vec4(col, 1.0); })";
     bool sdl_up_ = false;
     std::string title_, status_;
     bool title_dirty_ = true;
-    Uint32 last_tick_ = 0;
+
+    // redraw control
+    bool view_dirty_ = true;     // camera / window changed: redraw now
+    bool data_dirty_ = false;    // new points or poses: redraw when due
+    bool dragging_ = false;      // mouse button held: draw subsampled
+    Uint32 next_data_draw_ = 0;  // SDL ticks
 
     GLuint prog_ = 0;
     GLint u_mvp_ = -1, u_range_ = -1, u_flat_ = -1, u_psize_ = -1;
     GLuint vao_pts_ = 0, vbo_pts_ = 0, vao_traj_ = 0, vbo_traj_ = 0, vao_axes_ = 0, vbo_axes_ = 0;
 
-    std::vector<float> pts_;   // x y z s
+    static constexpr size_t kStride = 4 * sizeof(float);  // bytes per point
+    static constexpr size_t kDragBudget = 2000000;        // points drawn while dragging
+    size_t n_pts_ = 0;      // points in vbo_pts_ (GPU only)
+    size_t cap_bytes_ = 0;  // allocated size of vbo_pts_
     std::vector<float> traj_;  // x y z 0
-    size_t cap_bytes_ = 0;
     Eigen::Matrix4f pose_ = Eigen::Matrix4f::Identity();
     bool has_pose_ = false;
 
